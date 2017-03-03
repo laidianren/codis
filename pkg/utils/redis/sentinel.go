@@ -66,7 +66,30 @@ func (s *Sentinel) errorf(err error, format string, arguments ...interface{}) {
 	}
 }
 
-func (s *Sentinel) subscribeCommand(client *Client, sentinel string, onSubscribed func(string)) error {
+func (s *Sentinel) dispatch(ctx context.Context, sentinel string, timeout time.Duration,
+	fn func(client *Client) error) error {
+	c, err := NewClientNoAuth(sentinel, timeout)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	var exit = make(chan error, 1)
+
+	go func() {
+		exit <- fn(c)
+	}()
+
+	select {
+	case <-ctx.Done():
+		return errors.Trace(ctx.Err())
+	case err := <-exit:
+		return err
+	}
+}
+
+func (s *Sentinel) subscribeCommand(client *Client, sentinel string,
+	onSubscribed func()) error {
 	var channels = []interface{}{"+switch-master"}
 	if err := client.Flush("SUBSCRIBE", channels...); err != nil {
 		return errors.Trace(err)
@@ -83,9 +106,7 @@ func (s *Sentinel) subscribeCommand(client *Client, sentinel string, onSubscribe
 			return errors.Errorf("invalid response = %v", values)
 		}
 	}
-	if onSubscribed != nil {
-		onSubscribed(sentinel)
-	}
+	onSubscribed()
 	for {
 		values, err := redigo.Values(client.Receive())
 		if err != nil {
@@ -111,28 +132,20 @@ func (s *Sentinel) subscribeCommand(client *Client, sentinel string, onSubscribe
 	}
 }
 
-func (s *Sentinel) subscribeInstance(ctx context.Context, sentinel string, timeout time.Duration, onSubscribed func(string)) (bool, error) {
-	c, err := NewClientNoAuth(sentinel, timeout)
+func (s *Sentinel) subscribeInstance(ctx context.Context, sentinel string, timeout time.Duration,
+	onSubscribed func()) (bool, error) {
+	var err = s.dispatch(ctx, sentinel, timeout, func(c *Client) error {
+		return s.subscribeCommand(c, sentinel, onSubscribed)
+	})
 	if err != nil {
-		return false, err
-	}
-	defer c.Close()
-
-	var exit = make(chan error, 1)
-
-	go func() {
-		exit <- s.subscribeCommand(c, sentinel, onSubscribed)
-	}()
-
-	select {
-	case <-ctx.Done():
-		return false, nil
-	case err := <-exit:
-		if err != nil {
+		switch errors.Cause(err) {
+		case context.Canceled, context.DeadlineExceeded:
+			return false, nil
+		default:
 			return false, err
 		}
-		return true, nil
 	}
+	return true, nil
 }
 
 func (s *Sentinel) Subscribe(timeout time.Duration, onMajoritySubscribed func(), sentinels ...string) bool {
@@ -144,17 +157,14 @@ func (s *Sentinel) Subscribe(timeout time.Duration, onMajoritySubscribed func(),
 
 	var majority = 1 + len(sentinels)/2
 
-	var count atomic2.Int64
-
-	onSubscribed := func(sentinel string) {
-		var total = int(count.Incr())
-		if total == majority && onMajoritySubscribed != nil {
-			onMajoritySubscribed()
-		}
-	}
+	var subscribed atomic2.Int64
 	for i := range sentinels {
 		go func(sentinel string) {
-			notified, err := s.subscribeInstance(cntx, sentinel, timeout, onSubscribed)
+			notified, err := s.subscribeInstance(cntx, sentinel, timeout, func() {
+				if subscribed.Incr() == int64(majority) {
+					onMajoritySubscribed()
+				}
+			})
 			if err != nil {
 				s.errorf(err, "sentinel-[%s] subscribe failed", sentinel)
 			}
@@ -176,21 +186,20 @@ func (s *Sentinel) Subscribe(timeout time.Duration, onMajoritySubscribed func(),
 			}
 			return false
 		case notified := <-results:
-			if !notified {
-				continue
+			if notified {
+				s.printf("sentinel subscribe notified +switch-master")
+				return true
 			}
-			s.printf("sentinel subscribe notified +switch-master")
-			return true
 		}
 	}
 }
 
 func (s *Sentinel) existsCommand(client *Client, name string) (bool, error) {
-	if reply, err := client.Do("SENTINEL", "get-master-addr-by-name", name); err != nil {
+	r, err := client.Do("SENTINEL", "get-master-addr-by-name", name)
+	if err != nil {
 		return false, errors.Trace(err)
-	} else {
-		return reply != nil, nil
 	}
+	return r != nil, nil
 }
 
 func (s *Sentinel) masterCommand(client *Client, name string) (map[string]string, error) {
@@ -245,21 +254,10 @@ func (s *Sentinel) mastersCommand(client *Client) ([]map[string]string, error) {
 	return masters, nil
 }
 
-func (s *Sentinel) mastersInstance(ctx context.Context, sentinel string, groups map[int]bool, timeout time.Duration) (map[int]*SentinelMaster, error) {
-	c, err := NewClientNoAuth(sentinel, timeout)
-	if err != nil {
-		return nil, err
-	}
-	defer c.Close()
-
-	masters := make(map[int]*SentinelMaster)
-
-	var exit = make(chan error, 1)
-
-	go func() (err error) {
-		defer func() {
-			exit <- err
-		}()
+func (s *Sentinel) mastersInstance(ctx context.Context, sentinel string, timeout time.Duration,
+	groups map[int]bool) (map[int]*SentinelMaster, error) {
+	var masters = make(map[int]*SentinelMaster)
+	var err = s.dispatch(ctx, sentinel, timeout, func(c *Client) error {
 		for gid := range groups {
 			var name = s.NodeName(gid)
 			master, err := s.masterCommand(c, name)
@@ -270,12 +268,19 @@ func (s *Sentinel) mastersInstance(ctx context.Context, sentinel string, groups 
 			}
 			epoch, err := strconv.ParseInt(master["config-epoch"], 10, 64)
 			if err != nil {
-				s.printf("sentinel-[%s] masters parse config-epoch failed, %s", sentinel, err)
+				s.printf("sentinel-[%s] masters parse %s failed, config-epoch = '%s', %s",
+					sentinel, name, master["config-epoch"], err)
 				continue
 			}
 			ip, port := master["ip"], master["port"]
 			if ip == "" || port == "" {
-				s.printf("sentinel-[%s] masters parse ip:port failed, '%s:%s'", sentinel, ip, port)
+				s.printf("sentinel-[%s] masters parse %s failed, ip:port = '%s:%s'",
+					sentinel, name, ip, port)
+				continue
+			}
+			if runid := master["runid"]; runid == "" {
+				s.printf("sentinel-[%s] masters parse %s failed, ip:port = '%s:%s', runid is empty",
+					sentinel, name, ip, port)
 				continue
 			}
 			masters[gid] = &SentinelMaster{
@@ -284,17 +289,16 @@ func (s *Sentinel) mastersInstance(ctx context.Context, sentinel string, groups 
 			}
 		}
 		return nil
-	}()
-
-	select {
-	case <-ctx.Done():
-		return nil, nil
-	case err := <-exit:
-		if err != nil {
+	})
+	if err != nil {
+		switch errors.Cause(err) {
+		case context.Canceled:
+			return nil, nil
+		default:
 			return nil, err
 		}
-		return masters, nil
 	}
+	return masters, nil
 }
 
 type SentinelMaster struct {
@@ -314,7 +318,7 @@ func (s *Sentinel) Masters(groups map[int]bool, timeout time.Duration, sentinels
 
 	for i := range sentinels {
 		go func(sentinel string) {
-			masters, err := s.mastersInstance(cntx, sentinel, groups, timeout)
+			masters, err := s.mastersInstance(cntx, sentinel, timeout, groups)
 			if err != nil {
 				s.errorf(err, "sentinel-[%s] masters failed", sentinel)
 			}
@@ -328,11 +332,13 @@ func (s *Sentinel) Masters(groups map[int]bool, timeout time.Duration, sentinels
 	var voted int
 	for alive := len(sentinels); ; alive-- {
 		if alive == 0 {
-			if cntx.Err() == context.Canceled {
+			switch {
+			case cntx.Err() == context.Canceled:
 				s.printf("sentinel masters canceled (%v)", cntx.Err())
 				return nil, errors.Trace(cntx.Err())
-			} else if voted != len(sentinels) || len(masters) != len(groups) {
-				s.printf("sentinel masters voted = (%d/%d) masters = (%d/%d) (%v)", voted, len(sentinels), len(masters), len(groups), cntx.Err())
+			case voted != len(sentinels) || len(masters) != len(groups):
+				s.printf("sentinel masters voted = (%d/%d) masters = (%d/%d) (%v)",
+					voted, len(sentinels), len(masters), len(groups), cntx.Err())
 			}
 			if voted < majority {
 				return nil, errors.Errorf("lost majority (%d/%d)", voted, len(sentinels))
@@ -341,11 +347,13 @@ func (s *Sentinel) Masters(groups map[int]bool, timeout time.Duration, sentinels
 		}
 		select {
 		case <-cntx.Done():
-			if cntx.Err() == context.Canceled {
+			switch {
+			case cntx.Err() == context.Canceled:
 				s.printf("sentinel masters canceled (%v)", cntx.Err())
 				return nil, errors.Trace(cntx.Err())
-			} else {
-				s.printf("sentinel masters voted = (%d/%d) masters = (%d/%d) (%v)", voted, len(sentinels), len(masters), len(groups), cntx.Err())
+			default:
+				s.printf("sentinel masters voted = (%d/%d) masters = (%d/%d) (%v)",
+					voted, len(sentinels), len(masters), len(groups), cntx.Err())
 			}
 			if voted < majority {
 				return nil, errors.Errorf("lost majority (%d/%d)", voted, len(sentinels))
@@ -387,9 +395,8 @@ func (s *Sentinel) monitorCommand(client *Client, sentniel string, groups map[in
 				return errors.Trace(err)
 			}
 		}
-		var host = tcpAddr.IP.String()
-		var port = tcpAddr.Port
-		_, err := client.Do("SENTINEL", "monitor", name, host, port, config.Quorum)
+		var ip, port = tcpAddr.IP.String(), tcpAddr.Port
+		_, err := client.Do("SENTINEL", "monitor", name, ip, port, config.Quorum)
 		if err != nil {
 			return errors.Trace(err)
 		} else {
@@ -421,25 +428,20 @@ func (s *Sentinel) monitorCommand(client *Client, sentniel string, groups map[in
 	return nil
 }
 
-func (s *Sentinel) monitorInstance(ctx context.Context, sentinel string, groups map[int]*net.TCPAddr, config *MonitorConfig, timeout time.Duration) error {
-	c, err := NewClientNoAuth(sentinel, timeout)
+func (s *Sentinel) monitorInstance(ctx context.Context, sentinel string, timeout time.Duration,
+	groups map[int]*net.TCPAddr, config *MonitorConfig) error {
+	var err = s.dispatch(ctx, sentinel, timeout, func(c *Client) error {
+		return s.monitorCommand(c, sentinel, groups, config)
+	})
 	if err != nil {
-		return err
+		switch errors.Cause(err) {
+		case context.Canceled:
+			return nil
+		default:
+			return err
+		}
 	}
-	defer c.Close()
-
-	var exit = make(chan error, 1)
-
-	go func() {
-		exit <- s.monitorCommand(c, sentinel, groups, config)
-	}()
-
-	select {
-	case <-ctx.Done():
-		return nil
-	case err := <-exit:
-		return err
-	}
+	return nil
 }
 
 func (s *Sentinel) Monitor(groups map[int]string, config *MonitorConfig, timeout time.Duration, sentinels ...string) error {
@@ -487,7 +489,7 @@ func (s *Sentinel) Monitor(groups map[int]string, config *MonitorConfig, timeout
 
 	for i := range sentinels {
 		go func(sentinel string) {
-			err := s.monitorInstance(cntx, sentinel, resolve, config, timeout)
+			err := s.monitorInstance(cntx, sentinel, timeout, resolve, config)
 			if err != nil {
 				s.errorf(err, "sentinel-[%s] monitor failed", sentinel)
 			}
@@ -527,25 +529,20 @@ func (s *Sentinel) unmonitorCommand(client *Client, sentinel string, groups map[
 	return nil
 }
 
-func (s *Sentinel) unmonitorInstance(ctx context.Context, sentinel string, groups map[int]bool, timeout time.Duration) error {
-	c, err := NewClientNoAuth(sentinel, timeout)
+func (s *Sentinel) unmonitorInstance(ctx context.Context, sentinel string, timeout time.Duration,
+	groups map[int]bool) error {
+	var err = s.dispatch(ctx, sentinel, timeout, func(c *Client) error {
+		return s.unmonitorCommand(c, sentinel, groups)
+	})
 	if err != nil {
-		return err
+		switch errors.Cause(err) {
+		case context.Canceled:
+			return nil
+		default:
+			return err
+		}
 	}
-	defer c.Close()
-
-	var exit = make(chan error, 1)
-
-	go func() {
-		exit <- s.unmonitorCommand(c, sentinel, groups)
-	}()
-
-	select {
-	case <-ctx.Done():
-		return nil
-	case err := <-exit:
-		return err
-	}
+	return nil
 }
 
 func (s *Sentinel) Unmonitor(groups map[int]bool, timeout time.Duration, sentinels ...string) error {
@@ -557,7 +554,7 @@ func (s *Sentinel) Unmonitor(groups map[int]bool, timeout time.Duration, sentine
 
 	for i := range sentinels {
 		go func(sentinel string) {
-			err := s.unmonitorInstance(cntx, sentinel, groups, timeout)
+			err := s.unmonitorInstance(cntx, sentinel, timeout, groups)
 			if err != nil {
 				s.errorf(err, "sentinel-[%s] unmonitor failed", sentinel)
 			}
