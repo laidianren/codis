@@ -88,6 +88,16 @@ func (s *Sentinel) dispatch(ctx context.Context, sentinel string, timeout time.D
 	}
 }
 
+func (s *Sentinel) do(sentinel string, timeout time.Duration,
+	fn func(client *Client) error) error {
+	c, err := NewClientNoAuth(sentinel, timeout)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	return fn(c)
+}
+
 func (s *Sentinel) subscribeCommand(client *Client, sentinel string,
 	onSubscribed func()) error {
 	var channels = []interface{}{"+switch-master"}
@@ -148,7 +158,7 @@ func (s *Sentinel) subscribeInstance(ctx context.Context, sentinel string, timeo
 	return true, nil
 }
 
-func (s *Sentinel) Subscribe(timeout time.Duration, onMajoritySubscribed func(), sentinels ...string) bool {
+func (s *Sentinel) Subscribe(sentinels []string, timeout time.Duration, onMajoritySubscribed func()) bool {
 	cntx, cancel := context.WithTimeout(s.Context, timeout)
 	defer cancel()
 
@@ -307,7 +317,7 @@ type SentinelMaster struct {
 	Epoch int64
 }
 
-func (s *Sentinel) Masters(groups map[int]bool, timeout time.Duration, sentinels ...string) (map[int]string, error) {
+func (s *Sentinel) Masters(sentinels []string, timeout time.Duration, groups map[int]bool) (map[int]string, error) {
 	cntx, cancel := context.WithTimeout(s.Context, timeout)
 	defer cancel()
 
@@ -384,7 +394,7 @@ type MonitorConfig struct {
 	ClientReconfigScript string
 }
 
-func (s *Sentinel) monitorCommand(client *Client, sentniel string, groups map[int]*net.TCPAddr, config *MonitorConfig) error {
+func (s *Sentinel) monitorGroupsCommand(client *Client, sentniel string, config *MonitorConfig, groups map[int]*net.TCPAddr) error {
 	for gid, tcpAddr := range groups {
 		var name = s.NodeName(gid)
 		if exists, err := s.existsCommand(client, name); err != nil {
@@ -428,10 +438,10 @@ func (s *Sentinel) monitorCommand(client *Client, sentniel string, groups map[in
 	return nil
 }
 
-func (s *Sentinel) monitorInstance(ctx context.Context, sentinel string, timeout time.Duration,
-	groups map[int]*net.TCPAddr, config *MonitorConfig) error {
+func (s *Sentinel) monitorGroupsInstance(ctx context.Context, sentinel string, timeout time.Duration,
+	config *MonitorConfig, groups map[int]*net.TCPAddr) error {
 	var err = s.dispatch(ctx, sentinel, timeout, func(c *Client) error {
-		return s.monitorCommand(c, sentinel, groups, config)
+		return s.monitorGroupsCommand(c, sentinel, config, groups)
 	})
 	if err != nil {
 		switch errors.Cause(err) {
@@ -444,7 +454,7 @@ func (s *Sentinel) monitorInstance(ctx context.Context, sentinel string, timeout
 	return nil
 }
 
-func (s *Sentinel) Monitor(groups map[int]string, config *MonitorConfig, timeout time.Duration, sentinels ...string) error {
+func (s *Sentinel) MonitorGroups(sentinels []string, timeout time.Duration, config *MonitorConfig, groups map[int]string) error {
 	cntx, cancel := context.WithTimeout(s.Context, timeout)
 	defer cancel()
 
@@ -489,7 +499,7 @@ func (s *Sentinel) Monitor(groups map[int]string, config *MonitorConfig, timeout
 
 	for i := range sentinels {
 		go func(sentinel string) {
-			err := s.monitorInstance(cntx, sentinel, timeout, resolve, config)
+			err := s.monitorGroupsInstance(cntx, sentinel, timeout, config, resolve)
 			if err != nil {
 				s.errorf(err, "sentinel-[%s] monitor failed", sentinel)
 			}
@@ -545,7 +555,7 @@ func (s *Sentinel) unmonitorInstance(ctx context.Context, sentinel string, timeo
 	return nil
 }
 
-func (s *Sentinel) Unmonitor(groups map[int]bool, timeout time.Duration, sentinels ...string) error {
+func (s *Sentinel) Unmonitor(sentinels []string, timeout time.Duration, groups map[int]bool) error {
 	cntx, cancel := context.WithTimeout(s.Context, timeout)
 	defer cancel()
 
@@ -604,22 +614,27 @@ func (s *Sentinel) MastersAndSlavesClient(client *Client) (map[string]*SentinelG
 }
 
 func (s *Sentinel) MastersAndSlaves(sentinel string, timeout time.Duration) (map[string]*SentinelGroup, error) {
-	c, err := NewClientNoAuth(sentinel, timeout)
+	var results map[string]*SentinelGroup
+	var err = s.do(sentinel, timeout, func(c *Client) error {
+		m, err := s.MastersAndSlavesClient(c)
+		if err != nil {
+			return err
+		}
+		results = m
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer c.Close()
-	return s.MastersAndSlavesClient(c)
+	return results, nil
 }
 
-func (s *Sentinel) FlushConfig(sentinel string) error {
-	c, err := NewClientNoAuth(sentinel, time.Second)
-	if err != nil {
-		return err
-	}
-	defer c.Close()
-	if _, err := c.Do("SENTINEL", "flushconfig"); err != nil {
-		return err
-	}
-	return nil
+func (s *Sentinel) FlushConfig(sentinel string, timeout time.Duration) error {
+	return s.do(sentinel, timeout, func(c *Client) error {
+		_, err := c.Do("SENTINEL", "flushconfig")
+		if err != nil {
+			return err
+		}
+		return nil
+	})
 }

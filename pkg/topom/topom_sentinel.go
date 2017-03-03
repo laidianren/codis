@@ -34,7 +34,7 @@ func (s *Topom) AddSentinel(addr string) error {
 	}
 
 	sentinel := redis.NewSentinel(s.config.ProductName, s.config.ProductAuth)
-	if err := sentinel.FlushConfig(addr); err != nil {
+	if err := sentinel.FlushConfig(addr, time.Second*5); err != nil {
 		return err
 	}
 	defer s.dirtySentinelCache()
@@ -74,7 +74,7 @@ func (s *Topom) DelSentinel(addr string, force bool) error {
 	}
 
 	sentinel := redis.NewSentinel(s.config.ProductName, s.config.ProductAuth)
-	if err := sentinel.Unmonitor(ctx.getGroupIds(), time.Second*5, addr); err != nil {
+	if err := sentinel.Unmonitor([]string{addr}, time.Second*5, ctx.getGroupIds()); err != nil {
 		log.WarnErrorf(err, "remove sentinel %s failed", addr)
 		if !force {
 			return errors.Errorf("remove sentinel %s failed", addr)
@@ -150,7 +150,7 @@ func (s *Topom) rewatchSentinels(servers []string) {
 				for !p.IsCanceled() {
 					timeout := time.Minute * 15
 					retryAt := time.Now().Add(time.Second * 10)
-					if !p.Subscribe(timeout, callback, servers...) {
+					if !p.Subscribe(servers, timeout, callback) {
 						delayUntil(retryAt)
 					} else {
 						callback()
@@ -162,7 +162,7 @@ func (s *Topom) rewatchSentinels(servers []string) {
 					var success int
 					for i := 0; i != 10 && !p.IsCanceled() && success != 2; i++ {
 						timeout := time.Second * 5
-						masters, err := p.Masters(getGroupIds(), timeout, servers...)
+						masters, err := p.Masters(servers, timeout, getGroupIds())
 						if err != nil {
 							log.WarnErrorf(err, "fetch group masters failed")
 						} else {
@@ -205,7 +205,7 @@ func (s *Topom) ResyncSentinels() error {
 	}
 
 	sentinel := redis.NewSentinel(s.config.ProductName, s.config.ProductAuth)
-	if err := sentinel.Monitor(ctx.getGroupMasters(), config, time.Second*5, p.Servers...); err != nil {
+	if err := sentinel.MonitorGroups(p.Servers, time.Second*5, config, ctx.getGroupMasters()); err != nil {
 		log.WarnErrorf(err, "resync sentinels failed")
 		return err
 	}
